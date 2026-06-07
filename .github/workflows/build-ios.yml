@@ -134,14 +134,20 @@ jobs:
             "$TOOLKIT_DIR/build/pyside-setup"
 
       # ------------------------------ Prebuild Qt-for-iOS (cached, slow step)
-      - name: Cache Qt-for-iOS prebuild (QtRuntime.framework + static modules)
+      # Use restore/save split (NOT the combined cache action) so we only SAVE
+      # the cache AFTER the prebuild is verified complete. The combined action
+      # saves at post-job time even if a later step failed, which previously
+      # locked an incomplete set of libPySide6_*.a into the cache.
+      - name: Restore Qt-for-iOS prebuild
         id: cache-prebuild
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ env.TOOLKIT_DIR }}/build/QtRuntime.framework
             ${{ env.TOOLKIT_DIR }}/build/pyside6-ios-static
-          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v2
+          # Bump the trailing version whenever the prebuild recipe changes, to
+          # invalidate stale/poisoned caches. v3 = self-verifying module helpers.
+          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v3
 
       - name: Build QtRuntime.framework
         if: steps.cache-prebuild.outputs.cache-hit != 'true'
@@ -185,10 +191,12 @@ jobs:
       # (PySide6/<Module>/*.cpp, e.g. qtcorehelper.cpp, qiopipe.cpp,
       # qpytextobject.cpp) and the glue/ inject-code TUs, which CMake normally
       # compiles into the module target. Without them the app link fails with
-      # undefined symbols like QtCoreHelper::QIOPipe and QPyTextObject. Compile
-      # and append them to libPySide6_<Module>.a.
-      - name: Add per-module helper sources to module libraries
-        if: steps.cache-prebuild.outputs.cache-hit != 'true'
+      # undefined symbols like QtCoreHelper::QIOPipe and QPyTextObject. This step
+      # compiles + appends them AND verifies (via nm) that the required symbols
+      # are defined, aborting otherwise. It runs UNCONDITIONALLY: on a cache miss
+      # it does the work; on a cache hit it re-verifies the restored libraries
+      # (cheap and idempotent) so a poisoned cache can never slip through.
+      - name: Add per-module helper sources and verify module libraries
         run: bash ./ci/gen_module_helpers.sh "$TOOLKIT_DIR" QtCore QtGui QtWidgets
 
       - name: Verify Qt-for-iOS prebuild artifacts
@@ -200,6 +208,17 @@ jobs:
               || { echo "missing libPySide6_${mod}.a"; exit 1; }
           done
           echo "Prebuild OK."
+
+      # Save the cache ONLY now — after every prebuild step AND the verification
+      # gate have passed. On a cache hit this is skipped (key already exists).
+      - name: Save Qt-for-iOS prebuild
+        if: steps.cache-prebuild.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.TOOLKIT_DIR }}/build/QtRuntime.framework
+            ${{ env.TOOLKIT_DIR }}/build/pyside6-ios-static
+          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v3
 
       # ----------------------- Upload the Qt prebuild as its own artifact
       - name: Package Qt-for-iOS prebuild
