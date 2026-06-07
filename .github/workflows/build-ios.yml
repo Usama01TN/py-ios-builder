@@ -30,7 +30,7 @@ on:
         default: "3.13-b13"
       toolkit_repo:
         description: "Git URL of the pyside6-ios toolkit"
-        default: "https://github.com/your-org/pyside6-ios.git"
+        default: "https://github.com/patrickkidd/pyside6-ios.git"
       toolkit_ref:
         description: "Branch/tag/SHA of the toolkit to check out"
         default: "master"
@@ -40,7 +40,7 @@ env:
   QT_VERSION: "6.8.3"
   PYSIDE_VERSION: "6.8.3"
   PYTHON_APPLE_SUPPORT_TAG: "3.13-b13"
-  TOOLKIT_REPO: "https://github.com/your-org/pyside6-ios.git"
+  TOOLKIT_REPO: "https://github.com/patrickkidd/pyside6-ios.git"
   TOOLKIT_REF: "master"
 
 jobs:
