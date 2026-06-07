@@ -141,7 +141,7 @@ jobs:
           path: |
             ${{ env.TOOLKIT_DIR }}/build/QtRuntime.framework
             ${{ env.TOOLKIT_DIR }}/build/pyside6-ios-static
-          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}
+          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v2
 
       - name: Build QtRuntime.framework
         if: steps.cache-prebuild.outputs.cache-hit != 'true'
@@ -179,6 +179,17 @@ jobs:
           for mod in QtCore QtGui QtWidgets; do
             ./scripts/build_pyside6_module.sh "$mod"
           done
+
+      # build_pyside6_module.sh archives only the shiboken-generated *_wrapper.cpp
+      # files. Each module also needs hand-written helper sources
+      # (PySide6/<Module>/*.cpp, e.g. qtcorehelper.cpp, qiopipe.cpp,
+      # qpytextobject.cpp) and the glue/ inject-code TUs, which CMake normally
+      # compiles into the module target. Without them the app link fails with
+      # undefined symbols like QtCoreHelper::QIOPipe and QPyTextObject. Compile
+      # and append them to libPySide6_<Module>.a.
+      - name: Add per-module helper sources to module libraries
+        if: steps.cache-prebuild.outputs.cache-hit != 'true'
+        run: bash ./ci/gen_module_helpers.sh "$TOOLKIT_DIR" QtCore QtGui QtWidgets
 
       - name: Verify Qt-for-iOS prebuild artifacts
         run: |
