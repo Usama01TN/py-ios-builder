@@ -116,61 +116,56 @@ for mod in "${MODULES[@]}"; do
     mkdir -p "$obj_dir"
     added=()
 
-    # (a) Hand-written helper sources directly under the module dir.
-    #     moc-process those using the included-moc idiom first.
-    for src in "$mod_src_dir"/*.cpp; do
-        [ -e "$src" ] || continue
-        b="$(basename "$src")"
-        case "$b" in *_wrapper.cpp) continue;; esac
-        is_extra_source "$b" && continue
-        base="${b%.cpp}"
-        # Generate <base>.moc beside the source if the source includes it.
+    # moc include flags: QtCore always, plus this module's framework headers
+    # (e.g. qpytextobject.cpp in QtGui needs QtGui headers for moc to parse it).
+    moc_inc=(-I "$QT_IOS/include"
+             -I "$QT_IOS/lib/QtCore.framework/Headers"
+             -I "$QT_IOS/lib/QtCore.framework/Headers/$QT_VERSION")
+    if [ -d "$QT_IOS/lib/$mod.framework/Headers" ]; then
+        moc_inc+=(-I "$QT_IOS/lib/$mod.framework/Headers"
+                  -I "$QT_IOS/lib/$mod.framework/Headers/$QT_VERSION")
+    fi
+
+    # Compile one PySide6 source DIRECTLY (the way CMake's target_sources does):
+    # if it uses the included-moc idiom (#include "<base>.moc"), generate that
+    # .moc first, then compile the .cpp itself. Both the hand-written helper
+    # sources AND the glue/*.cpp files are real compilable sources in upstream
+    # CMake — they must NOT be wrapped in a synthetic TU (that yields inert,
+    # symbol-less objects for @snippet-style files).
+    compile_src() {
+        local src="$1" b base obj
+        b="$(basename "$src")"; base="${b%.cpp}"
+        case "$b" in *_wrapper.cpp) return 0;; esac      # generated wrappers built elsewhere
+        is_extra_source "$b" && return 0                 # toolkit already builds these
         if grep -Eq "#include[[:space:]]+\"${base}\.moc\"" "$src"; then
-            "$MOC" -I "$QT_IOS/include" -I "$QT_IOS/lib/QtCore.framework/Headers" \
-                   -I "$QT_IOS/lib/QtCore.framework/Headers/$QT_VERSION" \
-                   -I "$mod_src_dir" "$src" -o "$mod_src_dir/${base}.moc" 2>/dev/null \
-                || echo "      (moc note: ${base}.moc not generated; may be unneeded)" >&2
+            echo "    [$mod] moc: ${base}.moc"
+            if ! "$MOC" "${moc_inc[@]}" -I "$(dirname "$src")" "$src" \
+                    -o "$(dirname "$src")/${base}.moc" 2>/tmp/me.$$; then
+                echo "      WARN: moc failed for $b:" >&2; tail -6 /tmp/me.$$ >&2
+            fi
         fi
         obj="$obj_dir/${base}.o"
-        echo "    [$mod] helper: $b"
-        if $CXX "${FLAGS[@]}" -I "$mod_src_dir" -c "$src" -o "$obj" 2>/tmp/he.$$; then
+        echo "    [$mod] source: ${src#"$mod_src_dir/"}"
+        if $CXX "${FLAGS[@]}" -I "$(dirname "$src")" -c "$src" -o "$obj" 2>/tmp/ce.$$; then
             added+=("$obj")
         else
-            echo "      WARN: $b did not compile standalone:" >&2; tail -6 /tmp/he.$$ >&2
+            echo "      WARN: $b did not compile:" >&2; tail -8 /tmp/ce.$$ >&2
         fi
-    done
+        rm -f /tmp/me.$$ /tmp/ce.$$
+    }
 
-    # (b) Glue inject-code: not standalone. Wrap each glue/*.cpp in a TU that
-    #     includes the module umbrella header + PySide/shiboken support, then
-    #     #includes the glue body. This mirrors what shiboken does when it
-    #     splices glue into the module wrapper.
+    # (a) sources directly under the module dir
+    for src in "$mod_src_dir"/*.cpp; do
+        [ -e "$src" ] || continue
+        compile_src "$src"
+    done
+    # (b) glue sources — also real compilable sources (target_sources upstream)
     if [ -d "$mod_src_dir/glue" ]; then
-        for glue in "$mod_src_dir/glue"/*.cpp; do
-            [ -e "$glue" ] || continue
-            gb="$(basename "$glue")"; gbase="${gb%.cpp}"
-            tu="$obj_dir/glue_${gbase}.cpp"
-            {
-                echo "// auto-generated standalone TU wrapping PySide6 glue: $gb"
-                echo "#include <shiboken.h>"
-                echo "#include <sbkpython.h>"
-                echo "#include <pyside.h>"
-                echo "#include <signalmanager.h>"
-                echo "#include <pysideqobject.h>"
-                echo "#include <${mod}/${mod}>"
-                echo "#include \"${gb}\""
-            } > "$tu"
-            obj="$obj_dir/glue_${gbase}.o"
-            echo "    [$mod] glue: $gb (wrapped)"
-            if $CXX "${FLAGS[@]}" -I "$mod_src_dir" -I "$mod_src_dir/glue" \
-                    -c "$tu" -o "$obj" 2>/tmp/ge.$$; then
-                added+=("$obj")
-            else
-                echo "      note: glue $gb not directly compilable (likely already in wrappers):" >&2
-                tail -4 /tmp/ge.$$ >&2
-            fi
+        for src in "$mod_src_dir/glue"/*.cpp; do
+            [ -e "$src" ] || continue
+            compile_src "$src"
         done
     fi
-    rm -f /tmp/he.$$ /tmp/ge.$$
 
     if [ "${#added[@]}" -gt 0 ]; then
         echo "    [$mod] appending ${#added[@]} object(s) to $(basename "$lib")"
