@@ -147,7 +147,7 @@ jobs:
             ${{ env.TOOLKIT_DIR }}/build/pyside6-ios-static
           # Bump the trailing version whenever the prebuild recipe changes, to
           # invalidate stale/poisoned caches. v3 = self-verifying module helpers.
-          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v3
+          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v4
 
       - name: Build QtRuntime.framework
         if: steps.cache-prebuild.outputs.cache-hit != 'true'
@@ -178,6 +178,18 @@ jobs:
         working-directory: ${{ env.TOOLKIT_DIR }}
         run: ./scripts/build_support_libs.sh
 
+      # Shiboken resolves <inject-code file="..."> glue snippets on the
+      # typesystem path, but the toolkit's build_pyside6_module.sh does not put
+      # the per-module glue/ dirs there. As a result shiboken emits call sites
+      # for native helpers (init_QThread, qObjectFindChild, QVariant_*,
+      # PySideEasingCurveFunctor, PySide::addPostRoutine, Py*_ImportAndCheck, ...)
+      # but silently drops their definitions, breaking the app link. Patch the
+      # script to add the glue dirs to --typesystem-paths so the definitions are
+      # injected into the generated wrappers (which the toolkit then compiles).
+      - name: Patch toolkit so shiboken resolves PySide6 glue snippets
+        if: steps.cache-prebuild.outputs.cache-hit != 'true'
+        run: bash ./ci/patch_toolkit_glue_paths.sh "$TOOLKIT_DIR"
+
       - name: Cross-compile PySide6 modules (QtCore, QtGui, QtWidgets)
         if: steps.cache-prebuild.outputs.cache-hit != 'true'
         working-directory: ${{ env.TOOLKIT_DIR }}
@@ -187,15 +199,14 @@ jobs:
           done
 
       # build_pyside6_module.sh archives only the shiboken-generated *_wrapper.cpp
-      # files. Each module also needs hand-written helper sources
-      # (PySide6/<Module>/*.cpp, e.g. qtcorehelper.cpp, qiopipe.cpp,
-      # qpytextobject.cpp) and the glue/ inject-code TUs, which CMake normally
-      # compiles into the module target. Without them the app link fails with
-      # undefined symbols like QtCoreHelper::QIOPipe and QPyTextObject. This step
-      # compiles + appends them AND verifies (via nm) that the required symbols
-      # are defined, aborting otherwise. It runs UNCONDITIONALLY: on a cache miss
-      # it does the work; on a cache hit it re-verifies the restored libraries
-      # (cheap and idempotent) so a poisoned cache can never slip through.
+      # files. Each module also needs hand-written helper sources that live in
+      # PySide6/<Module>/ and PySide6/<Module>/glue/ (e.g. qtcorehelper.cpp,
+      # qiopipe.cpp, qpytextobject.cpp -> QtCoreHelper::*, QIOPipe, QPyTextObject).
+      # This step compiles + appends them (running moc where needed) AND verifies
+      # via nm that every required symbol is now DEFINED, aborting otherwise. It
+      # runs UNCONDITIONALLY: on a cache miss it does the work; on a cache hit it
+      # re-verifies the restored libraries (cheap, idempotent) so a poisoned
+      # cache can never slip through to the app-link stage.
       - name: Add per-module helper sources and verify module libraries
         run: bash ./ci/gen_module_helpers.sh "$TOOLKIT_DIR" QtCore QtGui QtWidgets
 
@@ -218,7 +229,7 @@ jobs:
           path: |
             ${{ env.TOOLKIT_DIR }}/build/QtRuntime.framework
             ${{ env.TOOLKIT_DIR }}/build/pyside6-ios-static
-          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v3
+          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v4
 
       # ----------------------- Upload the Qt prebuild as its own artifact
       - name: Package Qt-for-iOS prebuild
