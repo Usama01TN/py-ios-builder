@@ -158,6 +158,15 @@ jobs:
         if: steps.cache-prebuild.outputs.cache-hit != 'true'
         run: bash ./ci/gen_signature_embed.sh "$TOOLKIT_DIR"
 
+      # libpyside/libpysideqml use the "included moc" idiom: sources that declare
+      # a QObject inline end with #include "<self>.moc". Upstream CMake AUTOMOC
+      # produces those .moc files; the toolkit's standalone build_support_libs.sh
+      # does not. Generate them before compiling, or the build fails with e.g.
+      # fatal error: 'dynamicslot.moc' file not found.
+      - name: Generate included-moc files for support libraries
+        if: steps.cache-prebuild.outputs.cache-hit != 'true'
+        run: bash ./ci/gen_support_moc.sh "$TOOLKIT_DIR"
+
       - name: Build support libraries (libshiboken6 / libpyside6 / libpysideqml)
         if: steps.cache-prebuild.outputs.cache-hit != 'true'
         working-directory: ${{ env.TOOLKIT_DIR }}
