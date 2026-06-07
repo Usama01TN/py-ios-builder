@@ -148,6 +148,16 @@ jobs:
         working-directory: ${{ env.TOOLKIT_DIR }}
         run: ./scripts/build_qtruntime.sh
 
+      # libshiboken's signature_globals.cpp #includes embed/signature_inc.h,
+      # a CMake-generated header that pyside-setup does NOT ship and the
+      # toolkit's standalone build_support_libs.sh does not produce. Generate
+      # it (and signature_bootstrap_inc.h) with the upstream generator before
+      # compiling, exactly as CMake would. Without this the support-libs build
+      # fails with: fatal error: 'embed/signature_inc.h' file not found.
+      - name: Generate shiboken signature embed headers
+        if: steps.cache-prebuild.outputs.cache-hit != 'true'
+        run: bash ./ci/gen_signature_embed.sh "$TOOLKIT_DIR"
+
       - name: Build support libraries (libshiboken6 / libpyside6 / libpysideqml)
         if: steps.cache-prebuild.outputs.cache-hit != 'true'
         working-directory: ${{ env.TOOLKIT_DIR }}
