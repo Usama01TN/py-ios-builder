@@ -53,11 +53,14 @@ PYSIDE6_MODSRC_ROOT="$PYSIDE6_SRC"   # .../sources/pyside6/PySide6
 echo "==> Adding per-module helper sources to module libraries"
 echo "    PySide6 module sources: $PYSIDE6_MODSRC_ROOT"
 
-# Base flags mirror build_pyside6_module.sh's CXXFLAGS.
+# Base flags mirror build_pyside6_module.sh's CXXFLAGS. Populates the global
+# array FLAGS directly (no printing / mapfile) so it works on macOS's Bash 3.2
+# and preserves arguments that contain spaces.
+FLAGS=()
 base_cxxflags() {
     local mod="$1"
     local gendir="$P6IOS_ROOT/build/pyside6-ios-gen/PySide6/$mod"
-    local flags=(-arch arm64 -std=c++17 -isysroot "$IOS_SDK" -miphoneos-version-min=16.0
+    FLAGS=(-arch arm64 -std=c++17 -isysroot "$IOS_SDK" -miphoneos-version-min=16.0
         -iframework "$QT_IOS/lib" -I "$QT_IOS/include"
         $(qt_header_flags QtCore)
         -I "$PYTHON_FW/Headers" -I "$LIBSHIBOKEN_SRC" -I "$LIBPYSIDE_SRC"
@@ -67,14 +70,13 @@ base_cxxflags() {
         -DQT_LEAN_HEADERS=1 -DQT_NO_DEBUG -O2 -fPIC)
     # Per-module Qt framework headers (mirror the EXTRA_CXXFLAGS cases).
     case "$mod" in
-        QtGui)     flags+=($(qt_header_flags QtGui)) ;;
-        QtWidgets) flags+=($(qt_header_flags QtGui) $(qt_header_flags QtWidgets)
+        QtGui)     FLAGS+=($(qt_header_flags QtGui)) ;;
+        QtWidgets) FLAGS+=($(qt_header_flags QtGui) $(qt_header_flags QtWidgets)
                           -I "$P6IOS_ROOT/build/pyside6-ios-gen/PySide6/QtGui") ;;
-        QtNetwork) flags+=($(qt_header_flags QtNetwork)) ;;
-        QtQml)     flags+=(-I "$LIBPYSIDEQML_SRC" $(qt_header_flags QtQml)) ;;
-        QtQuick)   flags+=(-I "$LIBPYSIDEQML_SRC" $(qt_header_flags QtQml) $(qt_header_flags QtQuick)) ;;
+        QtNetwork) FLAGS+=($(qt_header_flags QtNetwork)) ;;
+        QtQml)     FLAGS+=(-I "$LIBPYSIDEQML_SRC" $(qt_header_flags QtQml)) ;;
+        QtQuick)   FLAGS+=(-I "$LIBPYSIDEQML_SRC" $(qt_header_flags QtQml) $(qt_header_flags QtQuick)) ;;
     esac
-    printf '%s\n' "${flags[@]}"
 }
 
 # Files the toolkit already builds as EXTRA_SOURCES (don't double-compile).
@@ -98,7 +100,7 @@ for mod in "${MODULES[@]}"; do
         continue
     fi
 
-    mapfile -t flags < <(base_cxxflags "$mod")
+    base_cxxflags "$mod"   # populates FLAGS
     obj_dir="$P6IOS_ROOT/build/$(echo "$mod" | tr '[:upper:]' '[:lower:]')-ios/helpers"
     mkdir -p "$obj_dir"
 
@@ -116,7 +118,7 @@ for mod in "${MODULES[@]}"; do
         is_extra_source "$b" && return
         obj="$obj_dir/${b%.cpp}.o"
         echo "    [$mod] compile helper: ${src#"$mod_src_dir/"}"
-        if "$CXX" "${flags[@]}" -I "$mod_src_dir" -I "$mod_src_dir/glue" \
+        if "$CXX" "${FLAGS[@]}" -I "$mod_src_dir" -I "$mod_src_dir/glue" \
                 -c "$src" -o "$obj" 2>/tmp/helper_err.$$; then
             added+=("$obj")
         else
