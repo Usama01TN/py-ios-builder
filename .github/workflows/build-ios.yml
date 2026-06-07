@@ -1,0 +1,265 @@
+name: Build testapp for iOS
+
+# Builds the bundled `testapp` (a PySide6 QtWidgets app) into an unsigned iOS
+# .app using the pyside6-ios toolkit + this repo's build_ios_app.py orchestrator.
+#
+# Produces two downloadable artifacts:
+#   * qt-ios-prebuild  — QtRuntime.framework + cross-compiled PySide6 static modules
+#   * testapp-ios-app  — the built TestApp.app (unsigned; .ipa-style payload zip too)
+#
+# Notes:
+#   * Runs on an Apple-Silicon macOS runner; the toolkit's scripts assume arm64 + Xcode 16+.
+#   * The build is UNSIGNED — GitHub-hosted runners have no signing identity or device.
+#     To install on a device, re-sign the .app (or open the generated .xcodeproj in Xcode).
+#   * The pyside6-ios toolkit is not vendored in this repo, so the workflow clones it.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      qt_version:
+        description: "Qt version (must have a matching shiboken6-generator on PyPI)"
+        default: "6.8.3"
+      pyside_version:
+        description: "PySide6 / shiboken6 version"
+        default: "6.8.3"
+      python_apple_support_tag:
+        description: "BeeWare Python-Apple-support release tag"
+        default: "3.13-b13"
+      toolkit_repo:
+        description: "Git URL of the pyside6-ios toolkit"
+        default: "https://github.com/your-org/pyside6-ios.git"
+      toolkit_ref:
+        description: "Branch/tag/SHA of the toolkit to check out"
+        default: "master"
+
+# Defaults used for push/PR triggers (workflow_dispatch inputs override these).
+env:
+  QT_VERSION: "6.8.3"
+  PYSIDE_VERSION: "6.8.3"
+  PYTHON_APPLE_SUPPORT_TAG: "3.13-b13"
+  TOOLKIT_REPO: "https://github.com/your-org/pyside6-ios.git"
+  TOOLKIT_REF: "master"
+
+jobs:
+  build-ios:
+    runs-on: macos-15            # Apple Silicon (arm64), Xcode 16.x available
+    timeout-minutes: 90
+
+    steps:
+      # ----------------------------------------------------------------- setup
+      - name: Checkout this repo (build_ios_app.py + testapp.zip)
+        uses: actions/checkout@v4
+
+      - name: Resolve build parameters
+        id: vars
+        run: |
+          echo "QT_VERSION=${{ github.event.inputs.qt_version || env.QT_VERSION }}"                                  >> "$GITHUB_ENV"
+          echo "PYSIDE_VERSION=${{ github.event.inputs.pyside_version || env.PYSIDE_VERSION }}"                      >> "$GITHUB_ENV"
+          echo "PYTHON_APPLE_SUPPORT_TAG=${{ github.event.inputs.python_apple_support_tag || env.PYTHON_APPLE_SUPPORT_TAG }}" >> "$GITHUB_ENV"
+          echo "TOOLKIT_REPO=${{ github.event.inputs.toolkit_repo || env.TOOLKIT_REPO }}"                           >> "$GITHUB_ENV"
+          echo "TOOLKIT_REF=${{ github.event.inputs.toolkit_ref || env.TOOLKIT_REF }}"                              >> "$GITHUB_ENV"
+          # Where the toolkit + its build outputs live (must be writable):
+          echo "TOOLKIT_DIR=$GITHUB_WORKSPACE/pyside6-ios"                                                          >> "$GITHUB_ENV"
+          # Where the Qt SDKs get installed:
+          echo "QT_ROOT=$HOME/Qt"                                                                                   >> "$GITHUB_ENV"
+
+      - name: Select Xcode 16 and confirm toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer || sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Set up Python 3.13 (host tooling)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Clone the pyside6-ios toolkit
+        run: |
+          git clone --depth 1 --branch "$TOOLKIT_REF" "$TOOLKIT_REPO" "$TOOLKIT_DIR"
+          echo "QT_IOS=$QT_ROOT/$QT_VERSION/ios"   >> "$GITHUB_ENV"
+          echo "QT_MACOS=$QT_ROOT/$QT_VERSION/macos" >> "$GITHUB_ENV"
+
+      - name: Install host Python deps (aqtinstall, shiboken6-generator)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "aqtinstall" "shiboken6-generator==$PYSIDE_VERSION"
+
+      # ---------------------------------------------------- Qt SDK (cached)
+      - name: Cache Qt SDKs (ios + macos)
+        id: cache-qt
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.QT_ROOT }}
+          key: qt-${{ env.QT_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Qt iOS + macOS SDKs
+        if: steps.cache-qt.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$QT_ROOT"
+          aqt install-qt mac ios     "$QT_VERSION" --outputdir "$QT_ROOT"
+          aqt install-qt mac desktop "$QT_VERSION" --outputdir "$QT_ROOT"
+
+      - name: Verify Qt iOS SDK present
+        run: |
+          test -d "$QT_IOS/lib/QtCore.framework" || { echo "Qt iOS SDK missing at $QT_IOS"; exit 1; }
+          echo "Qt iOS SDK: $QT_IOS"
+
+      # ------------------------------------------- CPython iOS framework
+      - name: Fetch CPython iOS framework (Python-Apple-support)
+        run: |
+          mkdir -p "$TOOLKIT_DIR/build/python"
+          # Tag "3.13-b13" -> asset "Python-3.13-iOS-support.b13.tar.gz"
+          PYVER="${PYTHON_APPLE_SUPPORT_TAG%-*}"     # e.g. 3.13
+          BUILD="${PYTHON_APPLE_SUPPORT_TAG##*-}"    # e.g. b13
+          ASSET="Python-${PYVER}-iOS-support.${BUILD}.tar.gz"
+          URL="https://github.com/beeware/Python-Apple-support/releases/download/${PYTHON_APPLE_SUPPORT_TAG}/${ASSET}"
+          echo "Fetching $URL"
+          curl -fL "$URL" | tar -xz -C "$TOOLKIT_DIR/build/python/"
+          test -d "$TOOLKIT_DIR/build/python/Python.xcframework/ios-arm64/Python.framework" \
+            || { echo "Python.xcframework not found after extract"; ls -R "$TOOLKIT_DIR/build/python" | head; exit 1; }
+
+      - name: Clone PySide6 sources (branch must match PYSIDE_VERSION)
+        run: |
+          git clone --depth 1 --branch "v$PYSIDE_VERSION" \
+            https://code.qt.io/pyside/pyside-setup.git \
+            "$TOOLKIT_DIR/build/pyside-setup"
+
+      # ------------------------------ Prebuild Qt-for-iOS (cached, slow step)
+      - name: Cache Qt-for-iOS prebuild (QtRuntime.framework + static modules)
+        id: cache-prebuild
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.TOOLKIT_DIR }}/build/QtRuntime.framework
+            ${{ env.TOOLKIT_DIR }}/build/pyside6-ios-static
+          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}
+
+      - name: Build QtRuntime.framework
+        if: steps.cache-prebuild.outputs.cache-hit != 'true'
+        working-directory: ${{ env.TOOLKIT_DIR }}
+        run: ./scripts/build_qtruntime.sh
+
+      - name: Build support libraries (libshiboken6 / libpyside6 / libpysideqml)
+        if: steps.cache-prebuild.outputs.cache-hit != 'true'
+        working-directory: ${{ env.TOOLKIT_DIR }}
+        run: ./scripts/build_support_libs.sh
+
+      - name: Cross-compile PySide6 modules (QtCore, QtGui, QtWidgets)
+        if: steps.cache-prebuild.outputs.cache-hit != 'true'
+        working-directory: ${{ env.TOOLKIT_DIR }}
+        run: |
+          for mod in QtCore QtGui QtWidgets; do
+            ./scripts/build_pyside6_module.sh "$mod"
+          done
+
+      - name: Verify Qt-for-iOS prebuild artifacts
+        run: |
+          ls -d "$TOOLKIT_DIR/build/"*QtRuntime.framework 2>/dev/null \
+            || find "$TOOLKIT_DIR/build" -name QtRuntime.framework -maxdepth 3
+          for mod in QtCore QtGui QtWidgets; do
+            test -f "$TOOLKIT_DIR/build/pyside6-ios-static/libPySide6_${mod}.a" \
+              || { echo "missing libPySide6_${mod}.a"; exit 1; }
+          done
+          echo "Prebuild OK."
+
+      # ----------------------- Upload the Qt prebuild as its own artifact
+      - name: Package Qt-for-iOS prebuild
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          ( cd "$TOOLKIT_DIR/build" && \
+            tar -czf "$GITHUB_WORKSPACE/artifacts/qt-ios-prebuild.tar.gz" \
+              $(find . -maxdepth 3 -name QtRuntime.framework -type d | sed 's|^\./||') \
+              pyside6-ios-static )
+
+      - name: Upload Qt-for-iOS prebuild artifact
+        id: upload-prebuild
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt-ios-prebuild
+          path: artifacts/qt-ios-prebuild.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      # --------------------------------- Scaffold + build the testapp app
+      - name: Unzip testapp
+        run: |
+          unzip -o testapp.zip -d _testapp_src
+          test -f _testapp_src/testapp/main.py
+
+      - name: Scaffold the testapp iOS project
+        run: |
+          python ci/scaffold_testapp.py \
+            --app-src     _testapp_src/testapp \
+            --project-dir build/testapp-ios \
+            --toolkit     "$TOOLKIT_DIR" \
+            --qt-ios      "$QT_IOS" \
+            --output-dir  generated \
+            --bundle-id   com.example.testapp \
+            --name        TestApp \
+            --version     1.0
+
+      - name: Install the pyside6-ios CLI
+        working-directory: ${{ env.TOOLKIT_DIR }}
+        run: uv pip install --system -e .
+
+      - name: Build testapp (.app, unsigned) via build_ios_app.py
+        run: |
+          python build_ios_app.py \
+            --config build/testapp-ios/pyside6-ios.toml \
+            --configuration Release \
+            --skip-checks
+        # --skip-checks: prerequisites were just built above; the orchestrator's
+        # host check would otherwise duplicate work. Drop it to re-verify.
+
+      - name: Locate the built .app
+        id: findapp
+        run: |
+          APP=$(find build/testapp-ios/generated -maxdepth 4 -name "TestApp.app" -type d | head -1)
+          test -n "$APP" || { echo "TestApp.app not found"; find build/testapp-ios/generated -maxdepth 4 -name "*.app"; exit 1; }
+          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
+          echo "Built: $APP"
+
+      # ----------------------------- Package + upload the app artifact
+      - name: Package TestApp.app (zip + Payload/ for sideload tools)
+        run: |
+          mkdir -p artifacts Payload
+          cp -R "$APP_PATH" "Payload/"
+          # .ipa is just a zip with a Payload/ dir; unsigned, so name it clearly.
+          ( cd . && zip -qry "artifacts/TestApp-unsigned.ipa" Payload )
+          ( cd "$(dirname "$APP_PATH")" && zip -qry "$GITHUB_WORKSPACE/artifacts/TestApp.app.zip" "$(basename "$APP_PATH")" )
+          ls -lh artifacts
+
+      - name: Upload testapp .app artifact
+        id: upload-app
+        uses: actions/upload-artifact@v4
+        with:
+          name: testapp-ios-app
+          path: |
+            artifacts/TestApp.app.zip
+            artifacts/TestApp-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      # --------------------------------------------- artifact links in summary
+      - name: Write artifact links to job summary
+        if: always()
+        run: |
+          {
+            echo "## iOS build artifacts"
+            echo ""
+            echo "| Artifact | Contents | Download |"
+            echo "| --- | --- | --- |"
+            echo "| **qt-ios-prebuild** | QtRuntime.framework + PySide6 static modules | ${{ steps.upload-prebuild.outputs.artifact-url }} |"
+            echo "| **testapp-ios-app** | TestApp.app.zip + TestApp-unsigned.ipa | ${{ steps.upload-app.outputs.artifact-url }} |"
+            echo ""
+            echo "The app is **unsigned** — re-sign before installing on a device, or open the generated \`.xcodeproj\` in Xcode."
+          } >> "$GITHUB_STEP_SUMMARY"
