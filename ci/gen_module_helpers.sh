@@ -128,10 +128,15 @@ for mod in "${MODULES[@]}"; do
 
     # Compile one PySide6 source DIRECTLY (the way CMake's target_sources does):
     # if it uses the included-moc idiom (#include "<base>.moc"), generate that
-    # .moc first, then compile the .cpp itself. Both the hand-written helper
-    # sources AND the glue/*.cpp files are real compilable sources in upstream
-    # CMake — they must NOT be wrapped in a synthetic TU (that yields inert,
-    # symbol-less objects for @snippet-style files).
+    # .moc first, then compile the .cpp itself.
+    #
+    # Note on glue/: real source files there (qiopipe.cpp, qtcorehelper.cpp)
+    # compile and define symbols. Pure @snippet files (core_snippets.cpp,
+    # qeasingcurve_glue.cpp) are NOT standalone — compiling them yields no
+    # symbols, and that is fine: their definitions are injected into the
+    # generated *_module_wrapper.cpp by shiboken once the glue dirs are on the
+    # typesystem path (see ci/patch_toolkit_glue_paths.sh). The verification gate
+    # below confirms every required symbol ends up defined regardless of source.
     compile_src() {
         local src="$1" b base obj
         b="$(basename "$src")"; base="${b%.cpp}"
