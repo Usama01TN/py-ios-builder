@@ -118,11 +118,30 @@ for mod in "${MODULES[@]}"; do
     mkdir -p "$obj_dir"
     added=()
 
-    # moc include flags: QtCore always, plus this module's framework headers
-    # (e.g. qpytextobject.cpp in QtGui needs QtGui headers for moc to parse it).
-    moc_inc=(-I "$QT_IOS/include"
-             -I "$QT_IOS/lib/QtCore.framework/Headers"
-             -I "$QT_IOS/lib/QtCore.framework/Headers/$QT_VERSION")
+    # moc must preprocess exactly like the compiler, or it silently emits an
+    # incomplete .moc that omits classes whose headers it couldn't resolve
+    # (this is why QtCoreHelper::QIOPipe's metaobject went missing). Build moc's
+    # flag set from the SAME include/define/framework flags $CXX uses: extract
+    # every -I/-F/-D/-isystem (with their arguments) from the compiler FLAGS.
+    moc_inc=()
+    _i=0
+    while [ "$_i" -lt "${#FLAGS[@]}" ]; do
+        f="${FLAGS[$_i]}"
+        case "$f" in
+            -I|-F|-isystem)
+                moc_inc+=("$f" "${FLAGS[$((_i+1))]}"); _i=$((_i+2)); continue ;;
+            -I*|-F*|-D*)
+                moc_inc+=("$f"); _i=$((_i+1)); continue ;;
+            -D)
+                moc_inc+=("$f" "${FLAGS[$((_i+1))]}"); _i=$((_i+2)); continue ;;
+        esac
+        _i=$((_i+1))
+    done
+    # Always include QtCore + this module's framework headers explicitly too.
+    moc_inc+=(-I "$QT_IOS/include"
+              -I "$QT_IOS/lib/QtCore.framework/Headers"
+              -I "$QT_IOS/lib/QtCore.framework/Headers/$QT_VERSION"
+              -F "$QT_IOS/lib")
     if [ -d "$QT_IOS/lib/$mod.framework/Headers" ]; then
         moc_inc+=(-I "$QT_IOS/lib/$mod.framework/Headers"
                   -I "$QT_IOS/lib/$mod.framework/Headers/$QT_VERSION")
@@ -328,11 +347,13 @@ for mod in "${MODULES[@]}"; do
         # Fully-qualified -> leaf name for the class-decl grep.
         leaf="${cls##*::}"
         [ -n "$leaf" ] || return 1
-        # Find a header declaring this class with Q_OBJECT.
+        # Find a header declaring this class with Q_OBJECT. Search the module
+        # dir first, then the whole pyside-setup tree (the header may live in
+        # libpyside or another shared location, not under the module dir).
         ( set +o pipefail
           grep -rlE "(class|struct)[[:space:]]+(Q_[A-Z_]+[[:space:]]+)?${leaf}\\b" \
-              "$PYSIDE6_SRC/$mod" 2>/dev/null \
-              | grep -E '\.h$'
+              "$PYSIDE6_SRC/$mod" "$PYSIDE6_SRC" "$PYSIDE_ROOT" 2>/dev/null \
+              | grep -E '\.h$' | awk '!seen[$0]++'
         ) > /tmp/hc.$$ 2>/dev/null || true
         while IFS= read -r hdr; do
             [ -n "$hdr" ] || continue
