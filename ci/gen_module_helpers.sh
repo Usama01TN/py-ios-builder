@@ -209,27 +209,99 @@ for mod in "${MODULES[@]}"; do
         total_added=$((total_added + ${#added[@]}))
     fi
 
-    # --- VERIFICATION GATE: every required symbol must now be DEFINED ---
+    # --- VERIFICATION + RECOVERY GATE ---
+    # For each required symbol still missing, search the ENTIRE pyside-setup tree
+    # and the generated wrappers for a source that actually DEFINES it, then
+    # compile + archive that source. This is model-independent: it locates the
+    # real definition wherever it lives (module dir, glue, libpyside, or a
+    # generated *_module_wrapper.cpp) instead of relying on assumptions.
+    PYSIDE_ROOT="$(dirname "$PYSIDE6_SRC")"          # .../sources/pyside6
+    GEN_ROOT="$P6IOS_ROOT/build/pyside6-ios-gen"
+
+    sym_defined() {  # $1 = needle (substring, demangled)
+        nm "$lib" 2>/dev/null | c++filt | grep -F "$1" | grep -qvE '^[[:xdigit:]]* *U '
+    }
+
+    # Map a required needle to a grep pattern that finds its DEFINITION in source.
+    def_pattern() {
+        case "$1" in
+            "init_QThread(")          echo 'init_QThread' ;;
+            "PySide::addPostRoutine") echo 'addPostRoutine' ;;
+            "PySideEasingCurveFunctor") echo 'PySideEasingCurveFunctor' ;;
+            *)                        echo "${1%(*}" ;;   # strip trailing '('
+        esac
+    }
+
+    recover_symbol() {  # $1 = required needle
+        local needle="$1" pat src obj b
+        pat="$(def_pattern "$needle")"
+        # Search generated wrappers first (shiboken may have emitted the def
+        # there), then the pyside-setup sources. Prefer files that look like a
+        # DEFINITION (pattern followed by '(' ... '{'), not just a reference.
+        local cand
+        cand=$(grep -rlE "[A-Za-z_:<>* ]+\\b${pat}\\b[^;]*\\{" \
+                  "$GEN_ROOT" "$PYSIDE_ROOT/PySide6" "$PYSIDE_ROOT/libpyside" \
+                  2>/dev/null | grep -E '\.(cpp|cc|mm)$' | head -1 || true)
+        [ -n "$cand" ] || return 1
+        b="$(basename "$cand")"
+        # Skip if we already compiled this exact file.
+        case " ${compiled_basenames:-} " in *" $b "*) return 1;; esac
+        echo "    [$mod] recovery: $needle -> compiling ${cand#"$PYSIDE_ROOT/"}" >&2
+        # moc if needed
+        local base="${b%.cpp}"
+        if grep -Eq "#include[[:space:]]+\"${base}\.moc\"" "$cand" 2>/dev/null; then
+            "$MOC" "${moc_inc[@]}" -I "$(dirname "$cand")" "$cand" \
+                -o "$(dirname "$cand")/${base}.moc" 2>/dev/null || true
+        fi
+        obj="$obj_dir/recover_${base}.o"
+        if $CXX "${FLAGS[@]}" -I "$(dirname "$cand")" -I "$GEN_ROOT/PySide6/$mod" \
+                -c "$cand" -o "$obj" 2>/tmp/re.$$; then
+            xcrun -sdk iphoneos libtool -static -o "$lib" "$lib" "$obj"
+            compiled_basenames="${compiled_basenames:-} $b"
+            rm -f /tmp/re.$$
+            return 0
+        fi
+        echo "      recovery compile failed for $b:" >&2; tail -10 /tmp/re.$$ >&2
+        rm -f /tmp/re.$$
+        return 1
+    }
+
     missing_syms=()
     while IFS= read -r sym; do
         [ -n "$sym" ] || continue
-        # A defined symbol shows a type letter other than 'U'. Search demangled.
-        if nm "$lib" 2>/dev/null | c++filt | grep -F "$sym" | grep -qvE '^[[:xdigit:]]* *U '; then
-            : # found at least one non-undefined occurrence
+        if sym_defined "$sym"; then continue; fi
+        # Try to recover by finding + compiling the real defining source.
+        recover_symbol "$sym" || true
+        if sym_defined "$sym"; then
+            echo "    [$mod] recovered: $sym"
+            continue
+        fi
+        if nm "$lib" 2>/dev/null | c++filt | grep -qF "$sym"; then
+            missing_syms+=("$sym (only undefined refs)")
         else
-            # Either absent entirely, or only undefined references exist.
-            if nm "$lib" 2>/dev/null | c++filt | grep -qF "$sym"; then
-                missing_syms+=("$sym (only undefined refs)")
-            else
-                missing_syms+=("$sym (absent)")
-            fi
+            missing_syms+=("$sym (absent)")
         fi
     done < <(required_symbols "$mod")
 
     if [ "${#missing_syms[@]}" -gt 0 ]; then
         echo "ERROR: libPySide6_${mod}.a is still missing required symbols:" >&2
         printf '    - %s\n' "${missing_syms[@]}" >&2
-        echo "    The helper/glue sources for $mod did not define them. Build cannot proceed." >&2
+        echo >&2
+        echo "==== DIAGNOSTICS (paste this back) ====" >&2
+        echo "-- glue dir --" >&2
+        ls "$PYSIDE6_SRC/$mod/glue" 2>&1 | sed 's/^/    /' >&2
+        echo "-- @snippet labels in glue/*.cpp --" >&2
+        grep -rhnE '^[[:space:]]*//[[:space:]]*@snippet' \
+            "$PYSIDE6_SRC/$mod/glue" 2>/dev/null | head -40 | sed 's/^/    /' >&2
+        for needle in "${missing_syms[@]}"; do
+            n="${needle%% *}"; pat="$(def_pattern "$n")"
+            echo "-- definition search for '$pat' across pyside-setup + gen --" >&2
+            grep -rlE "\\b${pat}\\b" "$GEN_ROOT" "$PYSIDE_ROOT/PySide6" \
+                "$PYSIDE_ROOT/libpyside" 2>/dev/null | head -8 | sed 's/^/    /' >&2
+        done
+        echo "-- objects currently in $(basename "$lib") --" >&2
+        nm -o "$lib" 2>/dev/null | sed -E 's/.*\((.*\.o)\).*/\1/' | sort -u | head -40 | sed 's/^/    /' >&2
+        echo "=======================================" >&2
         exit 1
     fi
     echo "    [$mod] verification OK — all required symbols defined."
