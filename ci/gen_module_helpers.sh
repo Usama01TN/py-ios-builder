@@ -151,12 +151,17 @@ for mod in "${MODULES[@]}"; do
         fi
         obj="$obj_dir/${base}.o"
         echo "    [$mod] source: ${src#"$mod_src_dir/"}"
-        if $CXX "${FLAGS[@]}" -I "$(dirname "$src")" -c "$src" -o "$obj" 2>/tmp/ce.$$; then
+        if $CXX "${FLAGS[@]}" -I "$(dirname "$src")" -c "$src" -o "$obj" 2>"$obj_dir/${base}.cclog"; then
             added+=("$obj")
+            # Detect the silent-but-empty case: compiled OK yet defines nothing.
+            if [ ! -s "$obj" ]; then
+                echo "      NOTE: $b produced an empty object" >&2
+            fi
         else
-            echo "      WARN: $b did not compile:" >&2; tail -8 /tmp/ce.$$ >&2
+            echo "      WARN: $b did NOT compile (full log below):" >&2
+            sed 's/^/        /' "$obj_dir/${base}.cclog" >&2
         fi
-        rm -f /tmp/me.$$ /tmp/ce.$$
+        rm -f /tmp/me.$$
     }
 
     # (a) sources directly under the module dir
@@ -284,24 +289,49 @@ for mod in "${MODULES[@]}"; do
     done < <(required_symbols "$mod")
 
     if [ "${#missing_syms[@]}" -gt 0 ]; then
-        echo "ERROR: libPySide6_${mod}.a is still missing required symbols:" >&2
-        printf '    - %s\n' "${missing_syms[@]}" >&2
-        echo >&2
-        echo "==== DIAGNOSTICS (paste this back) ====" >&2
-        echo "-- glue dir --" >&2
-        ls "$PYSIDE6_SRC/$mod/glue" 2>&1 | sed 's/^/    /' >&2
-        echo "-- @snippet labels in glue/*.cpp --" >&2
-        grep -rhnE '^[[:space:]]*//[[:space:]]*@snippet' \
-            "$PYSIDE6_SRC/$mod/glue" 2>/dev/null | head -40 | sed 's/^/    /' >&2
+        {
+        echo "ERROR: libPySide6_${mod}.a is still missing required symbols:"
+        printf '    - %s\n' "${missing_syms[@]}"
+        echo
+        echo "==== DIAGNOSTICS (paste this back) ===="
+        gdir="$PYSIDE6_SRC/$mod/glue"
+        echo "-- glue dir --"
+        ls "$gdir" 2>&1 | sed 's/^/    /'
         for needle in "${missing_syms[@]}"; do
-            n="${needle%% *}"; pat="$(def_pattern "$n")"
-            echo "-- definition search for '$pat' across pyside-setup + gen --" >&2
-            grep -rlE "\\b${pat}\\b" "$GEN_ROOT" "$PYSIDE_ROOT/PySide6" \
-                "$PYSIDE_ROOT/libpyside" 2>/dev/null | head -8 | sed 's/^/    /' >&2
+            n="${needle%% *}"; pat="${n%(*}"
+            echo "-- '$pat' occurrences in glue/ + module sources (file:line:text) --"
+            grep -rnE "$pat" "$gdir" "$PYSIDE6_SRC/$mod" 2>/dev/null \
+                | grep -vE '\.moc:' | head -12 | sed 's/^/    /'
         done
-        echo "-- objects currently in $(basename "$lib") --" >&2
-        nm -o "$lib" 2>/dev/null | sed -E 's/.*\((.*\.o)\).*/\1/' | sort -u | head -40 | sed 's/^/    /' >&2
-        echo "=======================================" >&2
+        echo "-- context of init_QThread in core_snippets.* (if present) --"
+        grep -rn -A3 'init_QThread' "$gdir"/core_snippets.* 2>/dev/null \
+            | head -30 | sed 's/^/    /'
+        echo "-- does the compiled core_snippets.o define it? --"
+        if [ -f "$obj_dir/core_snippets.o" ]; then
+            nm "$obj_dir/core_snippets.o" 2>/dev/null | c++filt \
+                | grep -iE 'init_QThread|qObjectFind|QVariant_|EasingCurve|addPostRoutine' \
+                | head -20 | sed 's/^/    /'
+            echo "    (T/t=defined external/local, U=undefined, S/s=data)"
+        else
+            echo "    core_snippets.o was NOT produced (compile failed)"
+        fi
+        echo "-- generated module wrapper: does it reference/define init_QThread? --"
+        mw="$P6IOS_ROOT/build/pyside6-ios-gen/PySide6/$mod/$(echo "$mod" | tr 'A-Z' 'a-z')_module_wrapper.cpp"
+        if [ -f "$mw" ]; then
+            grep -n 'init_QThread\|qObjectFindChild\|#include.*snippets' "$mw" 2>/dev/null \
+                | head -12 | sed 's/^/    /'
+        else
+            echo "    no module wrapper at $mw"
+        fi
+        echo "-- typesystem inject-code referencing these helpers --"
+        grep -rnE 'inject-code|insert-template|file=|snippet=' \
+            "$PYSIDE6_SRC/$mod"/typesystem_*.xml 2>/dev/null \
+            | grep -iE 'snippet|inject|core_snippets' | head -20 | sed 's/^/    /'
+        echo "-- objects currently in $(basename "$lib") --"
+        nm -o "$lib" 2>/dev/null | sed -E 's/.*\((.*\.o)\).*/\1/' | sort -u \
+            | head -40 | sed 's/^/    /'
+        echo "======================================="
+        } >&2
         exit 1
     fi
     echo "    [$mod] verification OK — all required symbols defined."
