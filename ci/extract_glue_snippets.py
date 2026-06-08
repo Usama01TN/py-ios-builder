@@ -62,30 +62,42 @@ def parse_snippets(text: str):
         yield cur_name, "\n".join(cur_body)
 
 
+def _strip_strings_comments(s: str) -> str:
+    """Remove // and /* */ comments and string/char literals so brace counting
+    isn't fooled. Cheap, line-oriented; good enough for the balance heuristic."""
+    # block comments
+    s = re.sub(r"/\*.*?\*/", " ", s, flags=re.DOTALL)
+    out_lines = []
+    for line in s.splitlines():
+        line = re.sub(r"//.*$", "", line)
+        line = re.sub(r'"(\\.|[^"\\])*"', '""', line)
+        line = re.sub(r"'(\\.|[^'\\])*'", "''", line)
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
 def is_standalone(body: str) -> bool:
-    """Heuristic: complete C++ (balanced braces, has a definition, no shiboken
-    placeholders)."""
+    """Keep a snippet if it looks like one or more complete C++ definitions:
+    has a parenthesized signature followed by a brace block, balanced braces
+    (ignoring strings/comments), and no shiboken placeholders. This is
+    deliberately permissive — the verification gate is the real safety net."""
     if not body.strip():
         return False
     if PLACEHOLDER_RE.search(body):
         return False
-    # Must contain at least one function/struct/class body.
-    if "{" not in body or "}" not in body:
+    clean = _strip_strings_comments(body)
+    if "{" not in clean or "}" not in clean:
         return False
-    # Balanced braces / parens (cheap check, ignores strings but good enough to
-    # reject fragment snippets that are clearly partial).
-    if body.count("{") != body.count("}"):
+    if clean.count("{") != clean.count("}"):
         return False
-    if body.count("(") != body.count(")"):
-        return False
-    # Reject snippets that are obviously statement fragments (start with a
-    # statement keyword rather than a declaration).
-    first = next((l.strip() for l in body.splitlines() if l.strip()
-                  and not l.strip().startswith("//")), "")
-    if re.match(r"^(return|if|for|while|switch|delete|Py_|Shiboken::|auto\s+\w+\s*=)",
-                first):
-        return False
-    return True
+    # Must contain something that looks like a function/definition: a ')'
+    # followed (possibly across whitespace/newlines) by '{', OR a namespace/
+    # struct/class/template introducer with a body.
+    if re.search(r"\)\s*(const\s*)?(noexcept\s*)?\{", clean):
+        return True
+    if re.search(r"\b(namespace|struct|class|template)\b[^;]*\{", clean):
+        return True
+    return False
 
 
 def destatic(body: str) -> str:
@@ -129,6 +141,7 @@ def main() -> int:
         return 0
 
     kept = []   # (file, name)
+    rejected = []
     bodies = []
     seen_sigs = set()   # de-dup identical snippet bodies across files
     for cpp in sorted(glue_dir.glob("*.cpp")):
@@ -139,6 +152,7 @@ def main() -> int:
             continue
         for name, body in parse_snippets(text):
             if not is_standalone(body):
+                rejected.append((cpp.name, name))
                 continue
             body = destatic(body)
             sig = body.strip()
@@ -166,6 +180,11 @@ def main() -> int:
           f"from {glue_dir}")
     for fn, nm in kept:
         print(f"    + {fn}:{nm}")
+    if rejected:
+        print(f"extract[{args.module}]: skipped {len(rejected)} non-standalone "
+              f"snippet(s) (fragments/placeholders):", file=sys.stderr)
+        for fn, nm in rejected:
+            print(f"    - {fn}:{nm}", file=sys.stderr)
     return 0
 
 
