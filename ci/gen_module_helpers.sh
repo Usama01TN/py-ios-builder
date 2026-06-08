@@ -52,7 +52,6 @@ required_symbols() {
         QtCore) cat <<'SYMS'
 QtCoreHelper::QGenericArgumentHolder
 QtCoreHelper::QGenericReturnArgumentHolder
-QtCoreHelper::QIOPipe
 QtCoreHelper::QDirListingIterator
 QtCoreHelper::QIOPipe::staticMetaObject
 vtable for QtCoreHelper::QIOPipe
@@ -68,7 +67,6 @@ PyDateTime_ImportAndCheck
 SYMS
         ;;
         QtGui) cat <<'SYMS'
-QPyTextObject
 QPyTextObject::staticMetaObject
 vtable for QPyTextObject
 SYMS
@@ -315,12 +313,75 @@ for mod in "${MODULES[@]}"; do
         return 1
     }
 
+    # Recover a missing METAOBJECT symbol (staticMetaObject / vtable / qt_metacall
+    # / qt_metacast / metaObject / typeinfo for a Q_OBJECT class). These come from
+    # running moc on the HEADER that declares the class — which may live anywhere
+    # in the module's source tree, not necessarily next to a .cpp. We find that
+    # header by searching for "class <Leaf> ... Q_OBJECT", moc it, compile, and
+    # archive the result.
+    recover_metaobject() {  # $1 = needle, e.g. "QtCoreHelper::QIOPipe::staticMetaObject" or "vtable for QtCoreHelper::QIOPipe"
+        local needle="$1" cls leaf hdr mocsrc mocobj base
+        cls="$needle"
+        cls="${cls#vtable for }"; cls="${cls#typeinfo for }"
+        cls="${cls%::staticMetaObject}"; cls="${cls%::qt_metacall*}"
+        cls="${cls%::qt_metacast*}"; cls="${cls%::metaObject*}"
+        # Fully-qualified -> leaf name for the class-decl grep.
+        leaf="${cls##*::}"
+        [ -n "$leaf" ] || return 1
+        # Find a header declaring this class with Q_OBJECT.
+        ( set +o pipefail
+          grep -rlE "(class|struct)[[:space:]]+(Q_[A-Z_]+[[:space:]]+)?${leaf}\\b" \
+              "$PYSIDE6_SRC/$mod" 2>/dev/null \
+              | grep -E '\.h$'
+        ) > /tmp/hc.$$ 2>/dev/null || true
+        while IFS= read -r hdr; do
+            [ -n "$hdr" ] || continue
+            grep -Eq '\bQ_OBJECT\b|\bQ_GADGET\b' "$hdr" 2>/dev/null || continue
+            base="$(basename "${hdr%.h}")"
+            case " ${compiled_basenames:-} " in *" moc_${base}.cpp "*) continue;; esac
+            mocsrc="$obj_dir/moc_${base}.cpp"
+            echo "    [$mod] metaobject recovery: moc $(echo "${hdr#"$PYSIDE_ROOT/"}") for $cls" >&2
+            if "$MOC" "${moc_inc[@]}" -I "$(dirname "$hdr")" -I "$PYSIDE6_SRC/$mod" \
+                    "$hdr" -o "$mocsrc" 2>/tmp/mh.$$; then
+                mocobj="$obj_dir/moc_${base}.o"
+                if $CXX "${FLAGS[@]}" -I "$(dirname "$hdr")" -I "$GEN_ROOT/PySide6/$mod" \
+                        -c "$mocsrc" -o "$mocobj" 2>/tmp/mhc.$$; then
+                    xcrun -sdk iphoneos libtool -static -o "$lib" "$lib" "$mocobj"
+                    compiled_basenames="${compiled_basenames:-} moc_${base}.cpp"
+                    if sym_defined "$needle"; then
+                        rm -f /tmp/hc.$$ /tmp/mh.$$ /tmp/mhc.$$
+                        return 0
+                    fi
+                else
+                    echo "      moc_${base}.cpp did not compile:" >&2
+                    sed 's/^/        /' /tmp/mhc.$$ >&2
+                fi
+            else
+                echo "      moc failed on $(basename "$hdr"):" >&2; tail -6 /tmp/mh.$$ >&2
+            fi
+        done < /tmp/hc.$$
+        rm -f /tmp/hc.$$ /tmp/mh.$$ /tmp/mhc.$$
+        return 1
+    }
+
+    is_metaobject_sym() {
+        case "$1" in
+            *staticMetaObject|"vtable for "*|"typeinfo for "*|*qt_metacall*|*qt_metacast*|*::metaObject*) return 0;;
+            *) return 1;;
+        esac
+    }
+
     missing_syms=()
     while IFS= read -r sym; do
         [ -n "$sym" ] || continue
         if sym_defined "$sym"; then continue; fi
-        # Try to recover by finding + compiling the real defining source.
-        recover_symbol "$sym" || true
+        # Metaobject symbols need their declaring header moc'd; everything else
+        # is recovered by finding + compiling the defining source.
+        if is_metaobject_sym "$sym"; then
+            recover_metaobject "$sym" || true
+        else
+            recover_symbol "$sym" || true
+        fi
         if sym_defined "$sym"; then
             echo "    [$mod] recovered: $sym"
             continue
