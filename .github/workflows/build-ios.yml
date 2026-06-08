@@ -147,7 +147,7 @@ jobs:
             ${{ env.TOOLKIT_DIR }}/build/pyside6-ios-static
           # Bump the trailing version whenever the prebuild recipe changes, to
           # invalidate stale/poisoned caches. v3 = self-verifying module helpers.
-          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v4
+          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v5
 
       - name: Build QtRuntime.framework
         if: steps.cache-prebuild.outputs.cache-hit != 'true'
@@ -229,7 +229,7 @@ jobs:
           path: |
             ${{ env.TOOLKIT_DIR }}/build/QtRuntime.framework
             ${{ env.TOOLKIT_DIR }}/build/pyside6-ios-static
-          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v4
+          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v5
 
       # ----------------------- Upload the Qt prebuild as its own artifact
       - name: Package Qt-for-iOS prebuild
