@@ -172,6 +172,37 @@ for mod in "${MODULES[@]}"; do
         done
     fi
 
+    # (c) Native glue @snippet definitions. Pure @snippet files (core_snippets.cpp,
+    #     qeasingcurve_glue.cpp) are not standalone-compilable, and shiboken does
+    #     not reliably inject their definitions in this standalone build. Extract
+    #     the complete, placeholder-free definitions directly and compile them as
+    #     one TU with external linkage. This is deterministic and independent of
+    #     shiboken's glue resolution.
+    if [ -d "$mod_src_dir/glue" ]; then
+        mod_lower="$(echo "$mod" | tr 'A-Z' 'a-z')"
+        umbrella="pyside6_${mod_lower}_python.h"
+        extracted="$obj_dir/${mod_lower}_glue_extracted.cpp"
+        echo "    [$mod] extracting native glue snippet definitions"
+        if python3 "$(dirname "$0")/extract_glue_snippets.py" \
+                --module "$mod" \
+                --glue-dir "$mod_src_dir/glue" \
+                --umbrella "$umbrella" \
+                --out "$extracted"; then
+            if [ -s "$extracted" ] && grep -q '{' "$extracted"; then
+                obj="$obj_dir/${mod_lower}_glue_extracted.o"
+                if $CXX "${FLAGS[@]}" -I "$mod_src_dir" -I "$mod_src_dir/glue" \
+                        -c "$extracted" -o "$obj" 2>/tmp/ee.$$; then
+                    added+=("$obj")
+                    echo "    [$mod] compiled extracted glue definitions"
+                else
+                    echo "      WARN: extracted glue TU did not compile:" >&2
+                    tail -12 /tmp/ee.$$ >&2
+                fi
+                rm -f /tmp/ee.$$
+            fi
+        fi
+    fi
+
     if [ "${#added[@]}" -gt 0 ]; then
         echo "    [$mod] appending ${#added[@]} object(s) to $(basename "$lib")"
         xcrun -sdk iphoneos libtool -static -o "$lib" "$lib" "${added[@]}"
