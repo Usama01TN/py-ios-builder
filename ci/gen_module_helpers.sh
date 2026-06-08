@@ -54,6 +54,8 @@ QtCoreHelper::QGenericArgumentHolder
 QtCoreHelper::QGenericReturnArgumentHolder
 QtCoreHelper::QIOPipe
 QtCoreHelper::QDirListingIterator
+QtCoreHelper::QIOPipe::staticMetaObject
+vtable for QtCoreHelper::QIOPipe
 invokeMetaMethod
 qObjectFindChild
 qObjectTr
@@ -67,6 +69,8 @@ SYMS
         ;;
         QtGui) cat <<'SYMS'
 QPyTextObject
+QPyTextObject::staticMetaObject
+vtable for QPyTextObject
 SYMS
         ;;
         *) : ;;
@@ -138,22 +142,49 @@ for mod in "${MODULES[@]}"; do
     # typesystem path (see ci/patch_toolkit_glue_paths.sh). The verification gate
     # below confirms every required symbol ends up defined regardless of source.
     compile_src() {
-        local src="$1" b base obj
+        local src="$1" b base obj hdr mocsrc mocobj
         b="$(basename "$src")"; base="${b%.cpp}"
         case "$b" in *_wrapper.cpp) return 0;; esac      # generated wrappers built elsewhere
         is_extra_source "$b" && return 0                 # toolkit already builds these
+        # (i) included-moc idiom: the .cpp ends with #include "<base>.moc".
         if grep -Eq "#include[[:space:]]+\"${base}\.moc\"" "$src"; then
-            echo "    [$mod] moc: ${base}.moc"
+            echo "    [$mod] moc(included): ${base}.moc"
             if ! "$MOC" "${moc_inc[@]}" -I "$(dirname "$src")" "$src" \
                     -o "$(dirname "$src")/${base}.moc" 2>/tmp/me.$$; then
                 echo "      WARN: moc failed for $b:" >&2; tail -6 /tmp/me.$$ >&2
             fi
         fi
+        # (ii) header-moc idiom (CMake AUTOMOC): if a sibling header declares a
+        # QObject/Q_GADGET (e.g. qiopipe.h -> QtCoreHelper::QIOPipe,
+        # qpytextobject.h -> QPyTextObject), moc the HEADER into moc_<base>.cpp
+        # and compile it separately. Without this the class's metaobject
+        # (staticMetaObject, qt_metacall, qt_metacast, metaObject, vtable,
+        # typeinfo) is undefined at link time.
+        for hdr in "$(dirname "$src")/${base}.h" "$(dirname "$src")/${base}_p.h"; do
+            [ -f "$hdr" ] || continue
+            if grep -Eq '\bQ_OBJECT\b|\bQ_GADGET\b' "$hdr"; then
+                mocsrc="$obj_dir/moc_${base}.cpp"
+                echo "    [$mod] moc(header): $(basename "$hdr") -> moc_${base}.cpp"
+                if "$MOC" "${moc_inc[@]}" -I "$(dirname "$src")" "$hdr" -o "$mocsrc" 2>/tmp/mh.$$; then
+                    mocobj="$obj_dir/moc_${base}.o"
+                    if $CXX "${FLAGS[@]}" -I "$(dirname "$src")" -c "$mocsrc" -o "$mocobj" 2>/tmp/mhc.$$; then
+                        added+=("$mocobj")
+                    else
+                        echo "      WARN: moc_${base}.cpp did not compile:" >&2
+                        sed 's/^/        /' /tmp/mhc.$$ >&2
+                    fi
+                else
+                    echo "      WARN: moc(header) failed for $(basename "$hdr"):" >&2
+                    tail -6 /tmp/mh.$$ >&2
+                fi
+                rm -f /tmp/mh.$$ /tmp/mhc.$$
+                break   # one header per source is enough
+            fi
+        done
         obj="$obj_dir/${base}.o"
         echo "    [$mod] source: ${src#"$mod_src_dir/"}"
         if $CXX "${FLAGS[@]}" -I "$(dirname "$src")" -c "$src" -o "$obj" 2>"$obj_dir/${base}.cclog"; then
             added+=("$obj")
-            # Detect the silent-but-empty case: compiled OK yet defines nothing.
             if [ ! -s "$obj" ]; then
                 echo "      NOTE: $b produced an empty object" >&2
             fi
