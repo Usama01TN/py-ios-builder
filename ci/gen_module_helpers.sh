@@ -238,36 +238,49 @@ for mod in "${MODULES[@]}"; do
     }
 
     recover_symbol() {  # $1 = required needle
-        local needle="$1" pat src obj b
+        local needle="$1" pat obj b cand
         pat="$(def_pattern "$needle")"
-        # Search generated wrappers first (shiboken may have emitted the def
-        # there), then the pyside-setup sources. Prefer files that look like a
-        # DEFINITION (pattern followed by '(' ... '{'), not just a reference.
-        local cand
-        cand=$(grep -rlE "[A-Za-z_:<>* ]+\\b${pat}\\b[^;]*\\{" \
-                  "$GEN_ROOT" "$PYSIDE_ROOT/PySide6" "$PYSIDE_ROOT/libpyside" \
-                  2>/dev/null | grep -E '\.(cpp|cc|mm)$' | head -1 || true)
-        [ -n "$cand" ] || return 1
-        b="$(basename "$cand")"
-        # Skip if we already compiled this exact file.
-        case " ${compiled_basenames:-} " in *" $b "*) return 1;; esac
-        echo "    [$mod] recovery: $needle -> compiling ${cand#"$PYSIDE_ROOT/"}" >&2
-        # moc if needed
-        local base="${b%.cpp}"
-        if grep -Eq "#include[[:space:]]+\"${base}\.moc\"" "$cand" 2>/dev/null; then
-            "$MOC" "${moc_inc[@]}" -I "$(dirname "$cand")" "$cand" \
-                -o "$(dirname "$cand")/${base}.moc" 2>/dev/null || true
-        fi
-        obj="$obj_dir/recover_${base}.o"
-        if $CXX "${FLAGS[@]}" -I "$(dirname "$cand")" -I "$GEN_ROOT/PySide6/$mod" \
-                -c "$cand" -o "$obj" 2>/tmp/re.$$; then
-            xcrun -sdk iphoneos libtool -static -o "$lib" "$lib" "$obj"
-            compiled_basenames="${compiled_basenames:-} $b"
+        ( set +o pipefail
+          # Find files that DEFINE the pattern. A definition has the name
+          # followed (same line OR next lines) by a '{' before the next ';'.
+          # Approximate robustly: files containing the name AND not only as a
+          # bare prototype. We rank: module wrappers in gen first, then sources.
+          for root in "$GEN_ROOT" "$PYSIDE_ROOT/PySide6" "$PYSIDE_ROOT/libpyside" "$PYSIDE_ROOT"; do
+              grep -rlE "\\b${pat}\\b" "$root" 2>/dev/null \
+                  | grep -E '\.(cpp|cc|mm)$'
+          done | awk '!seen[$0]++'
+        ) > /tmp/cand.$$ 2>/dev/null || true
+
+        while IFS= read -r cand; do
+            [ -n "$cand" ] || continue
+            b="$(basename "$cand")"
+            case " ${compiled_basenames:-} " in *" $b "*) continue;; esac
+            # Compile any candidate that mentions the symbol. Compiling an extra
+            # source that happens not to define it is harmless (its object just
+            # won't contribute the symbol); the post-check below confirms.
+            echo "    [$mod] recovery: $needle -> compiling ${cand#"$PYSIDE_ROOT/"}" >&2
+            local base="${b%.cpp}"
+            if grep -Eq "#include[[:space:]]+\"${base}\.moc\"" "$cand" 2>/dev/null; then
+                "$MOC" "${moc_inc[@]}" -I "$(dirname "$cand")" "$cand" \
+                    -o "$(dirname "$cand")/${base}.moc" 2>/dev/null || true
+            fi
+            obj="$obj_dir/recover_${base}.o"
+            if $CXX "${FLAGS[@]}" -I "$(dirname "$cand")" -I "$GEN_ROOT/PySide6/$mod" \
+                    -c "$cand" -o "$obj" 2>/tmp/re.$$; then
+                xcrun -sdk iphoneos libtool -static -o "$lib" "$lib" "$obj"
+                compiled_basenames="${compiled_basenames:-} $b"
+                # Did this candidate actually provide the symbol?
+                if sym_defined "$needle"; then
+                    rm -f /tmp/re.$$ /tmp/cand.$$
+                    return 0
+                fi
+            else
+                echo "      recovery compile failed for $b (continuing):" >&2
+                tail -8 /tmp/re.$$ >&2
+            fi
             rm -f /tmp/re.$$
-            return 0
-        fi
-        echo "      recovery compile failed for $b:" >&2; tail -10 /tmp/re.$$ >&2
-        rm -f /tmp/re.$$
+        done < /tmp/cand.$$
+        rm -f /tmp/cand.$$
         return 1
     }
 
@@ -289,47 +302,55 @@ for mod in "${MODULES[@]}"; do
     done < <(required_symbols "$mod")
 
     if [ "${#missing_syms[@]}" -gt 0 ]; then
+        # IMPORTANT: disable -e and pipefail here. grep returns 1 when it finds
+        # nothing, and with `set -o pipefail` (set at top) that aborts the block
+        # mid-stream — which is exactly what was truncating these diagnostics.
+        set +e +o pipefail
         {
         echo "ERROR: libPySide6_${mod}.a is still missing required symbols:"
         printf '    - %s\n' "${missing_syms[@]}"
         echo
         echo "==== DIAGNOSTICS (paste this back) ===="
         gdir="$PYSIDE6_SRC/$mod/glue"
+        glow="$(echo "$mod" | tr 'A-Z' 'a-z')"
         echo "-- glue dir --"
         ls "$gdir" 2>&1 | sed 's/^/    /'
         for needle in "${missing_syms[@]}"; do
             n="${needle%% *}"; pat="${n%(*}"
-            echo "-- '$pat' occurrences in glue/ + module sources (file:line:text) --"
-            grep -rnE "$pat" "$gdir" "$PYSIDE6_SRC/$mod" 2>/dev/null \
-                | grep -vE '\.moc:' | head -12 | sed 's/^/    /'
+            echo "-- '$pat' across ENTIRE pyside-setup tree (definitions, file:line) --"
+            grep -rnE "\\b${pat}\\b" "$PYSIDE_ROOT" 2>/dev/null \
+                | grep -vE '\.moc:|\.o:|Binary' | head -8 | sed 's/^/    /'
+            echo "-- '$pat' in GENERATED gen dir --"
+            grep -rnE "\\b${pat}\\b" "$GEN_ROOT" 2>/dev/null \
+                | head -8 | sed 's/^/    /'
         done
-        echo "-- context of init_QThread in core_snippets.* (if present) --"
-        grep -rn -A3 'init_QThread' "$gdir"/core_snippets.* 2>/dev/null \
-            | head -30 | sed 's/^/    /'
-        echo "-- does the compiled core_snippets.o define it? --"
+        echo "-- context of init_QThread in core_snippets.* (declaration/definition) --"
+        grep -rn -B1 -A4 'init_QThread' "$gdir"/core_snippets.* 2>/dev/null \
+            | head -40 | sed 's/^/    /'
+        echo "-- nm of compiled core_snippets.o (T=ext def, t=local, U=undef) --"
         if [ -f "$obj_dir/core_snippets.o" ]; then
             nm "$obj_dir/core_snippets.o" 2>/dev/null | c++filt \
-                | grep -iE 'init_QThread|qObjectFind|QVariant_|EasingCurve|addPostRoutine' \
-                | head -20 | sed 's/^/    /'
-            echo "    (T/t=defined external/local, U=undefined, S/s=data)"
+                | grep -iE 'init_QThread|qObjectFind|QVariant_|EasingCurve|addPostRoutine|qObjectTr' \
+                | head -25 | sed 's/^/    /'
         else
-            echo "    core_snippets.o was NOT produced (compile failed)"
+            echo "    core_snippets.o was NOT produced"
         fi
-        echo "-- generated module wrapper: does it reference/define init_QThread? --"
-        mw="$P6IOS_ROOT/build/pyside6-ios-gen/PySide6/$mod/$(echo "$mod" | tr 'A-Z' 'a-z')_module_wrapper.cpp"
+        echo "-- generated module wrapper: init_QThread defined or only referenced? --"
+        mw="$GEN_ROOT/PySide6/$mod/${glow}_module_wrapper.cpp"
         if [ -f "$mw" ]; then
-            grep -n 'init_QThread\|qObjectFindChild\|#include.*snippets' "$mw" 2>/dev/null \
-                | head -12 | sed 's/^/    /'
+            grep -n 'init_QThread\|#include.*snippet\|insertHostMethod\|addPostRoutine' "$mw" 2>/dev/null \
+                | head -15 | sed 's/^/    /'
         else
             echo "    no module wrapper at $mw"
+            echo "    gen dir listing:"
+            ls "$GEN_ROOT/PySide6/$mod" 2>&1 | head -30 | sed 's/^/      /'
         fi
-        echo "-- typesystem inject-code referencing these helpers --"
-        grep -rnE 'inject-code|insert-template|file=|snippet=' \
+        echo "-- typesystem entries (inject-code / snippet / native) --"
+        grep -rnE 'inject-code|insert-template|add-function|snippet=|file=' \
             "$PYSIDE6_SRC/$mod"/typesystem_*.xml 2>/dev/null \
-            | grep -iE 'snippet|inject|core_snippets' | head -20 | sed 's/^/    /'
-        echo "-- objects currently in $(basename "$lib") --"
-        nm -o "$lib" 2>/dev/null | sed -E 's/.*\((.*\.o)\).*/\1/' | sort -u \
-            | head -40 | sed 's/^/    /'
+            | grep -iE 'snippet|inject|native|core_snippets|qthread' | head -25 | sed 's/^/    /'
+        echo "-- shiboken-generated files present in gen dir --"
+        ls "$GEN_ROOT/PySide6/$mod" 2>/dev/null | head -40 | sed 's/^/    /'
         echo "======================================="
         } >&2
         exit 1
