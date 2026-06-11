@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-scaffold_testapp.py — generate the pyside6-ios project files for `testapp`.
+scaffold_testapp.py â€” generate the pyside6-ios project files for `testapp`.
 
 `testapp/main.py` is a bare QtWidgets app (QApplication + QLabel). The
 pyside6-ios toolkit needs three things this app doesn't ship with:
 
-  1. pyside6-ios.toml         — build config (QtCore/QtGui/QtWidgets modules)
-  2. main.mm                  — custom host (QtWidgets needs QApplication, not
+  1. pyside6-ios.toml         â€” build config (QtCore/QtGui/QtWidgets modules)
+  2. main.mm                  â€” custom host (QtWidgets needs QApplication, not
                                 the auto-generated QGuiApplication)
-  3. scripts/app.py           — entry script run by main.mm via PyRun_SimpleFile.
+  3. scripts/app.py           â€” entry script run by main.mm via PyRun_SimpleFile.
                                 It must NOT create its own QApplication/argv
                                 (main.mm already did) and must showFullScreen().
 
@@ -34,7 +34,7 @@ from pathlib import Path
 
 # ---- main.mm: QtWidgets host, derived from the toolkit's test_widgets example,
 #      trimmed to the minimum testapp needs (no shiboken bindings, no native C++).
-MAIN_MM = r'''// testapp iOS host (custom main.mm) — QtWidgets variant.
+MAIN_MM = r'''// testapp iOS host (custom main.mm) â€” QtWidgets variant.
 // QtWidgets requires QApplication (the auto-generated template uses
 // QGuiApplication). After Python builds the UI, the Qt UIView is reparented
 // into the iOS UIWindow and top-level widgets are resized to fill the screen.
@@ -300,6 +300,18 @@ style = "Automatic"
 CLANG_ENABLE_MODULES = "YES"
 CODE_SIGNING_ALLOWED = "NO"
 CODE_SIGNING_REQUIRED = "NO"
+# Fix for the final-link failure with Xcode's new linker (ld-prime):
+#   ld: fixup error (kind=arm64_adrp_lo12_addend) ... target
+#   'QtPrivate::QMetaTypeInterfaceWrapper<int>::metaType' does not have address
+# Qt's inline static template members are weak/coalesced definitions; with
+# -dead_strip the linker can strip the weak definition while a live ADRP+LO12
+# reference remains, and the chained-fixups encoding cannot represent an
+# address-less target. Disable dead stripping (removes the cause) and opt out
+# of chained fixups (removes the encoding limitation). Belt and suspenders;
+# binary is larger but correct. If size matters later, try re-enabling
+# DEAD_CODE_STRIPPING first and keep -no_fixup_chains.
+DEAD_CODE_STRIPPING = "NO"
+OTHER_LDFLAGS = "-Wl,-no_fixup_chains"
 
 [defines]
 common = []
