@@ -142,12 +142,28 @@ jobs:
         id: cache-prebuild
         uses: actions/cache/restore@v4
         with:
+          # Cache EVERY prebuild output directory the generated app project
+          # links against (see the -L/-F flags in the app's Ld command):
+          #   QtRuntime.framework            -framework QtRuntime
+          #   pyside6-ios-static             libPySide6_<Module>.a
+          #   shiboken-ios                   shiboken_module_wrapper.o (direct input)
+          #   libshiboken-ios                -lshiboken6
+          #   libpyside-ios                  -lpyside6
+          #   libpysideqml-ios               -lpysideqml
+          # Caching only a subset makes cache-HIT runs fail at app link with
+          # "Build input file cannot be found" because the steps producing the
+          # missing dirs are skipped on a hit.
           path: |
             ${{ env.TOOLKIT_DIR }}/build/QtRuntime.framework
             ${{ env.TOOLKIT_DIR }}/build/pyside6-ios-static
-          # Bump the trailing version whenever the prebuild recipe changes, to
-          # invalidate stale/poisoned caches. v3 = self-verifying module helpers.
-          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v7
+            ${{ env.TOOLKIT_DIR }}/build/shiboken-ios
+            ${{ env.TOOLKIT_DIR }}/build/libshiboken-ios
+            ${{ env.TOOLKIT_DIR }}/build/libpyside-ios
+            ${{ env.TOOLKIT_DIR }}/build/libpysideqml-ios
+          # Bump the trailing version whenever the prebuild recipe or cached
+          # path set changes. v9 = discard poisoned v8 (incomplete support libs); cache all linked prebuild dirs (earlier keys cached
+          # only QtRuntime + pyside6-ios-static and broke cache-hit runs).
+          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v9
 
       - name: Build QtRuntime.framework
         if: steps.cache-prebuild.outputs.cache-hit != 'true'
@@ -176,7 +192,20 @@ jobs:
       - name: Build support libraries (libshiboken6 / libpyside6 / libpysideqml)
         if: steps.cache-prebuild.outputs.cache-hit != 'true'
         working-directory: ${{ env.TOOLKIT_DIR }}
-        run: ./scripts/build_support_libs.sh
+        run: |
+          ./scripts/build_support_libs.sh
+          # build_support_libs.sh compiles shiboken_module_wrapper.o with stderr
+          # suppressed and no error check, so a failed compile leaves the file
+          # missing while the script still exits 0. Fail fast here (at the source
+          # stage) instead of much later at app link with an opaque
+          # "Build input file cannot be found" error.
+          missing=0
+          test -f "build/shiboken-ios/shiboken_module_wrapper.o" || { echo "ERROR: build_support_libs.sh did not produce shiboken-ios/shiboken_module_wrapper.o"; missing=1; }
+          test -f "build/libshiboken-ios/libshiboken6.a"        || { echo "ERROR: missing libshiboken-ios/libshiboken6.a"; missing=1; }
+          test -f "build/libpyside-ios/libpyside6.a"            || { echo "ERROR: missing libpyside-ios/libpyside6.a"; missing=1; }
+          test -f "build/libpysideqml-ios/libpysideqml.a"       || { echo "ERROR: missing libpysideqml-ios/libpysideqml.a"; missing=1; }
+          [ "$missing" -eq 0 ] || { echo "Support-library build incomplete; aborting before it can be cached."; exit 1; }
+          echo "Support libraries built: shiboken_module_wrapper.o + libshiboken6/libpyside6/libpysideqml present."
 
       # Shiboken resolves <inject-code file="..."> glue snippets on the
       # typesystem path, but the toolkit's build_pyside6_module.sh does not put
@@ -218,7 +247,20 @@ jobs:
             test -f "$TOOLKIT_DIR/build/pyside6-ios-static/libPySide6_${mod}.a" \
               || { echo "missing libPySide6_${mod}.a"; exit 1; }
           done
-          echo "Prebuild OK."
+          # Everything else the generated app project links against (-L/-F dirs
+          # and the direct .o input). If any is absent the app link fails late
+          # with "Build input file cannot be found", so gate on them HERE so an
+          # incomplete prebuild can never be cached or reused.
+          test -f "$TOOLKIT_DIR/build/shiboken-ios/shiboken_module_wrapper.o" \
+            || { echo "missing shiboken-ios/shiboken_module_wrapper.o"; exit 1; }
+          for d in libshiboken-ios:libshiboken6.a \
+                   libpyside-ios:libpyside6.a \
+                   libpysideqml-ios:libpysideqml.a; do
+            dir="${d%%:*}"; ar="${d##*:}"
+            test -f "$TOOLKIT_DIR/build/$dir/$ar" \
+              || { echo "missing $dir/$ar"; exit 1; }
+          done
+          echo "Prebuild OK (all linked artifacts present)."
 
       # Save the cache ONLY now — after every prebuild step AND the verification
       # gate have passed. On a cache hit this is skipped (key already exists).
@@ -229,7 +271,11 @@ jobs:
           path: |
             ${{ env.TOOLKIT_DIR }}/build/QtRuntime.framework
             ${{ env.TOOLKIT_DIR }}/build/pyside6-ios-static
-          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v7
+            ${{ env.TOOLKIT_DIR }}/build/shiboken-ios
+            ${{ env.TOOLKIT_DIR }}/build/libshiboken-ios
+            ${{ env.TOOLKIT_DIR }}/build/libpyside-ios
+            ${{ env.TOOLKIT_DIR }}/build/libpysideqml-ios
+          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v9
 
       # ----------------------- Upload the Qt prebuild as its own artifact
       - name: Package Qt-for-iOS prebuild
