@@ -163,7 +163,7 @@ jobs:
           # Bump the trailing version whenever the prebuild recipe or cached
           # path set changes. v9 = discard poisoned v8 (incomplete support libs); cache all linked prebuild dirs (earlier keys cached
           # only QtRuntime + pyside6-ios-static and broke cache-hit runs).
-          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v9
+          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v10
 
       - name: Build QtRuntime.framework
         if: steps.cache-prebuild.outputs.cache-hit != 'true'
@@ -275,7 +275,7 @@ jobs:
             ${{ env.TOOLKIT_DIR }}/build/libshiboken-ios
             ${{ env.TOOLKIT_DIR }}/build/libpyside-ios
             ${{ env.TOOLKIT_DIR }}/build/libpysideqml-ios
-          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v9
+          key: prebuild-qt-${{ env.QT_VERSION }}-pyside-${{ env.PYSIDE_VERSION }}-${{ runner.arch }}-${{ env.TOOLKIT_REF }}-v10
 
       # ----------------------- Upload the Qt prebuild as its own artifact
       - name: Package Qt-for-iOS prebuild
