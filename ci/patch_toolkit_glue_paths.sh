@@ -89,4 +89,53 @@ PY
 
 echo "==> Verifying patch..."
 grep -n 'PYSIDE6_GLUE_PATHS' "$SCRIPT" >/dev/null || { echo "ERROR: patch did not apply" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Second patch: disable hot/cold function splitting + the machine outliner in
+# the support-lib AND module compiles.
+#
+# ROOT CAUSE this fixes
+#   At -O2, clang splits cold paths into separate ".cold" partitions and may
+#   outline code. A cold partition of
+#     QMetaType::registerConverter<PySide::PyObjectWrapper,int>(...)
+#   in libpyside6.a(signalmanager.o) references the weak template static
+#     QtPrivate::QMetaTypeInterfaceWrapper<int>::metaType
+#   with a DIRECT adrp/add pair instead of GOT-indirection. When that weak
+#   symbol is coalesced/absent the direct ADRP target is null, and the classic
+#   linker reports:
+#     ld: ARM64 ADRP out of range (-4306632704 max is +/-4GB) ... metaType ...
+#   Removing the cold split keeps every reference on the GOT-indirected hot
+#   path, so the out-of-range direct relocation is never emitted.
+#
+# THE FIX: append codegen flags to the base CXXFLAGS of both scripts.
+COLD_FLAGS='-fno-split-cold-code -mllvm -enable-machine-outliner=never'
+for f in build_pyside6_module.sh build_support_libs.sh; do
+    s="$TOOLKIT_DIR/scripts/$f"
+    [ -f "$s" ] || { echo "WARN: $s not found, skipping codegen patch" >&2; continue; }
+    if grep -q 'NO_COLD_SPLIT_PATCHED' "$s"; then
+        echo "==> $f already patched for codegen flags; skipping."
+        continue
+    fi
+    python3 - "$s" "$COLD_FLAGS" <<'PY'
+import sys
+path, cold = sys.argv[1], sys.argv[2]
+src = open(path).read()
+# Both scripts close their base flags array with "-O2 -fPIC)". Insert the
+# cold-split-disabling flags right before the closing paren so they apply to
+# every compile that uses the base flags.
+needle = '-O2 -fPIC)'
+if needle not in src:
+    sys.stderr.write(f"ERROR: '{needle}' not found in {path}\n"); sys.exit(1)
+repl = f'-O2 -fPIC {cold})  # NO_COLD_SPLIT_PATCHED'
+src = src.replace(needle, repl, 1)
+open(path, "w").write(src)
+print(f"    patched: appended cold-split/outliner-disabling flags to {path.split('/')[-1]}")
+PY
+done
+
+echo "==> Verifying codegen patch..."
+grep -q 'NO_COLD_SPLIT_PATCHED' "$TOOLKIT_DIR/scripts/build_support_libs.sh" \
+  || { echo "ERROR: codegen patch did not apply to build_support_libs.sh" >&2; exit 1; }
+grep -q 'NO_COLD_SPLIT_PATCHED' "$TOOLKIT_DIR/scripts/build_pyside6_module.sh" \
+  || { echo "ERROR: codegen patch did not apply to build_pyside6_module.sh" >&2; exit 1; }
 echo "==> Done."
