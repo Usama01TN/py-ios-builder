@@ -300,21 +300,27 @@ style = "Automatic"
 CLANG_ENABLE_MODULES = "YES"
 CODE_SIGNING_ALLOWED = "NO"
 CODE_SIGNING_REQUIRED = "NO"
-# Static-linking the three shiboken module wrappers (QtCore/QtGui/QtWidgets) plus
-# shiboken_module_wrapper.o produces duplicate definitions of shared converter
-# helpers (createQIntList, *_Check, Sbk*TypeConverters, cleanTypesAttributes,
-# ...). With dead-code stripping ENABLED the linker coalesces these weak/dup
-# definitions and emits them only as warnings (the link proceeds). Disabling it
-# turns them into 26 FATAL "duplicate symbol" errors, so keep it ON.
+# Two linker issues had to be reconciled for the static PySide6 link on Xcode's
+# new linker (ld-prime), and they pull in opposite directions:
 #
-# The separate ld-prime fixup failure
-#   ld: fixup error (kind=arm64_adrp_lo12_addend) ... QMetaTypeInterfaceWrapper
-#   <int>::metaType does not have address
-# is fixed independently by opting out of chained fixups; that does NOT require
-# disabling dead-stripping. So: dead-strip ON + -no_fixup_chains is the
-# combination that links cleanly for static PySide6 on Xcode's new linker.
+#   * DEAD_CODE_STRIPPING = NO  -> the 26 duplicate converter symbols
+#     (createQIntList, *_Check, Sbk*TypeConverters, cleanTypesAttributes, ...)
+#     that come from statically linking the three module wrappers become FATAL.
+#   * DEAD_CODE_STRIPPING = YES -> ld-prime hits
+#       ld: fixup error (kind=arm64_adrp_lo12_addend) ...
+#       QtPrivate::QMetaTypeInterfaceWrapper<int>::metaType does not have address
+#     and -Wl,-no_fixup_chains does NOT prevent it (verified: the flag was on
+#     the link line and the error still occurred).
+#
+# Resolution: keep dead-stripping ON (so the duplicates stay warnings) and
+# switch the link to the CLASSIC linker backend (ld64) via -ld64. ld64 does not
+# use chained fixups and handles weak template-static data the pre-Xcode15 way
+# that PySide static linking has always relied on, so the fixup error cannot
+# arise. This is Apple DTS's documented workaround for ld-prime regressions.
+# (-ld64 is the backend selector that is reliably accepted for the iOS target;
+# the newer spelling -ld_classic is not always recognized there.)
 DEAD_CODE_STRIPPING = "YES"
-OTHER_LDFLAGS = "-Wl,-no_fixup_chains"
+OTHER_LDFLAGS = "-ld64"
 
 [defines]
 common = []
